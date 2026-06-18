@@ -147,155 +147,92 @@ def change_resolution(width, height):
 
 
 # ---------------------------------------------------------------------------
-# NVIDIA desktop color control via registry + gamma ramp API
+# NVIDIA desktop color control via NVAPI
 # ---------------------------------------------------------------------------
-def _find_nvidia_video_keys():
-    """Locate HKLM registry keys for NVIDIA display adapter with color settings.
-    Scans ALL subkeys (0000, 0001, …) under each Video GUID."""
-    import winreg
+class _NV_COLOR_DATA(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_uint32),
+        ("cmd", ctypes.c_uint32),
+        ("channel", ctypes.c_uint32),
+        ("colorSetting", ctypes.c_uint32),
+        ("value", ctypes.c_float),
+        ("reserved", ctypes.c_uint32 * 31),
+    ]
 
-    def _val(key, name):
+
+def _nvapi_set_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Apply NVIDIA color settings via NVAPI (primary method)."""
+    try:
+        nvapi = ctypes.WinDLL("nvapi64.dll")
+    except OSError:
+        raise RuntimeError("nvapi64.dll not found")
+
+    NvAPI_Initialize = nvapi[1]
+    NvAPI_Initialize.restype = ctypes.c_int32
+    if NvAPI_Initialize() != 0:
+        raise RuntimeError("NvAPI_Initialize failed")
+
+    NvAPI_GetHandle = nvapi[14]
+    NvAPI_GetHandle.restype = ctypes.c_int32
+    NvAPI_GetHandle.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+
+    handle = ctypes.c_void_p()
+    found = False
+    i = 0
+    while True:
         try:
-            v, _ = winreg.QueryValueEx(key, name)
-            return v
-        except FileNotFoundError:
-            return None
+            dev = win32api.EnumDisplayDevices(None, i, 0)
+        except Exception:
+            break
+        if not dev.DeviceName:
+            break
+        ret = NvAPI_GetHandle(dev.DeviceName, ctypes.byref(handle))
+        if ret == 0:
+            found = True
+            break
+        i += 1
 
-    results = []
-    base_path = r"SYSTEM\CurrentControlSet\Control\Video"
+    if not found:
+        raise RuntimeError("No NVIDIA display handle found via NVAPI")
 
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_path) as root:
-            i = 0
-            while True:
-                try:
-                    guid = winreg.EnumKey(root, i)
-                except OSError:
-                    break
-                guid_path = f"{base_path}\\{guid}"
-                try:
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, guid_path) as gk:
-                        j = 0
-                        while True:
-                            try:
-                                sub = winreg.EnumKey(gk, j)
-                            except OSError:
-                                break
-                            sub_path = f"{guid_path}\\{sub}"
-                            try:
-                                with winreg.OpenKey(
-                                    winreg.HKEY_LOCAL_MACHINE, sub_path
-                                ) as sk:
-                                    desc = _val(sk, "DriverDesc")
-                                    if desc and "nvidia" in desc.lower():
-                                        b = _val(sk, "Brightness")
-                                        c = _val(sk, "Contrast")
-                                        v = _val(sk, "DigitalVibrance")
-                                        if (
-                                            b is not None
-                                            and c is not None
-                                            and v is not None
-                                        ):
-                                            results.append((guid_path, sub_path))
-                            except OSError:
-                                pass
-                            j += 1
-                except OSError:
-                    pass
-                i += 1
-    except OSError:
-        pass
+    ctrl_size = ctypes.sizeof(_NV_COLOR_DATA)
+    version = (2 << 16) | ctrl_size
 
-    return results
+    settings = [
+        (0, float(brightness_pct)),
+        (1, float(contrast_pct)),
+        (4, float(gamma_val)),
+        (5, float(vibrance_pct)),
+    ]
 
+    for ordinal in (80, 55, 60):
+        try:
+            NvAPI_SetColorData = nvapi[ordinal]
+            break
+        except AttributeError:
+            continue
+    else:
+        raise RuntimeError("NvAPI_SetColorData ordinal not found")
 
-def _broadcast_display_change():
-    ctypes.windll.user32.SendMessageTimeoutW(
-        HWND_BROADCAST, WM_SETTINGCHANGE, 0, 0, 0, 5000, None
-    )
+    NvAPI_SetColorData.restype = ctypes.c_int32
 
-
-def _apply_nvidia_hkcu(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    """Write color settings to HKCU so NVIDIA Control Panel sliders move."""
-    import winreg
-
-    b_val = int(max(0, min(100, brightness_pct)) * 2.55)
-    c_val = int(max(0, min(100, contrast_pct)) * 2.55)
-    v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
-    g_val = max(0, min(255, int(gamma_val * 128)))
-
-    base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as root:
-            i = 0
-            while True:
-                try:
-                    sub = winreg.EnumKey(root, i)
-                except OSError:
-                    break
-                sub_path = f"{base}\\{sub}"
-                try:
-                    with winreg.OpenKey(
-                        winreg.HKEY_CURRENT_USER, sub_path, 0,
-                        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
-                    ) as k:
-                        try:
-                            winreg.QueryValueEx(k, "Brightness")
-                        except FileNotFoundError:
-                            i += 1
-                            continue
-                        pairs = [
-                            ("Brightness", b_val),
-                            ("Contrast", c_val),
-                            ("Gamma", g_val),
-                            ("DigitalVibrance", v_val),
-                        ]
-                        for name, val in pairs:
-                            try:
-                                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
-                            except Exception:
-                                pass
-                except OSError:
-                    pass
-                i += 1
-    except OSError:
-        pass
+    for setting, val in settings:
+        data = _NV_COLOR_DATA()
+        data.version = version
+        data.cmd = 1
+        data.channel = 0
+        data.colorSetting = setting
+        data.value = val
+        ret = NvAPI_SetColorData(handle, ctypes.byref(data))
+        if ret != 0:
+            print(f"[WARN] NVAPI color setting {setting} returned {ret}")
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    import winreg
-
-    b_val = int(max(0, min(100, brightness_pct)) * 2.55)
-    c_val = int(max(0, min(100, contrast_pct)) * 2.55)
-    v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
-
-    # Write to HKCU so NVIDIA Control Panel sliders reflect the change
-    _apply_nvidia_hkcu(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
-
-    # Write to HKLM driver-level registry as well
-    keys = _find_nvidia_video_keys()
-    if keys:
-        for _, key_path in keys:
-            try:
-                with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    key_path,
-                    0,
-                    winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
-                ) as k:
-                    for name, val in [("Brightness", b_val), ("Contrast", c_val)]:
-                        try:
-                            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
-                        except Exception:
-                            pass
-                    try:
-                        winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, v_val)
-                    except Exception as exc:
-                        print(f"[WARN] DigitalVibrance HKLM write failed: {exc}")
-            except Exception:
-                continue
-
-    _broadcast_display_change()
+    _nvapi_set_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     time.sleep(0.5)
 
 
@@ -684,19 +621,15 @@ class CinemaModeApp:
     def _activate_cinema_mode(self):
         self._set_status("Активация кинорежима...")
 
+        self._set_status("Включение HDR...")
+        toggle_hdr(enable=True)
+        time.sleep(1.5)
+
         self._set_status("Смена разрешения на 4K...")
         if not change_resolution(*RES_4K):
             self._set_status("Не удалось изменить разрешение на 4K", True)
             return
         time.sleep(1.5)
-
-        self._set_status("Сброс цветов NVIDIA (50% / 1.0 gamma)...")
-        apply_nvidia_settings(50, 50, 1.0, 50)
-        time.sleep(0.5)
-
-        self._set_status("Включение HDR...")
-        toggle_hdr(enable=True)
-        time.sleep(1.0)
 
         lampa = self.lampa_entry.get().strip()
         torr = self.ts_entry.get().strip()
@@ -706,6 +639,10 @@ class CinemaModeApp:
         if torr:
             self._set_status("Запуск TorrServer...")
             launch_app(torr)
+
+        self._set_status("Сброс цветов NVIDIA (50% / 1.0 gamma)...")
+        apply_nvidia_settings(50, 50, 1.0, 50)
+        time.sleep(0.5)
 
         self.active = True
         self.root.after(
@@ -731,6 +668,12 @@ class CinemaModeApp:
         toggle_hdr(enable=False)
         time.sleep(2.0)
 
+        self._set_status("Смена разрешения на 2K...")
+        if not change_resolution(*RES_2K):
+            self._set_status("Не удалось изменить разрешение на 2K", True)
+            return
+        time.sleep(1.5)
+
         b = self._get_slider_val("brightness")
         c = self._get_slider_val("contrast")
         g = self._get_slider_val("gamma")
@@ -738,12 +681,6 @@ class CinemaModeApp:
         self._set_status("Применение пользовательских цветов NVIDIA...")
         apply_nvidia_settings(b, c, g, v)
         time.sleep(0.5)
-
-        self._set_status("Смена разрешения на 2K...")
-        if not change_resolution(*RES_2K):
-            self._set_status("Не удалось изменить разрешение на 2K", True)
-            return
-        time.sleep(1.5)
 
         self.active = False
         self.root.after(
