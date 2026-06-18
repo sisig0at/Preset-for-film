@@ -150,8 +150,16 @@ def change_resolution(width, height):
 # NVIDIA desktop color control via registry + gamma ramp API
 # ---------------------------------------------------------------------------
 def _find_nvidia_video_keys():
-    """Locate HKLM registry keys for NVIDIA display adapter with color settings."""
+    """Locate HKLM registry keys for NVIDIA display adapter with color settings.
+    Scans ALL subkeys (0000, 0001, …) under each Video GUID."""
     import winreg
+
+    def _val(key, name):
+        try:
+            v, _ = winreg.QueryValueEx(key, name)
+            return v
+        except FileNotFoundError:
+            return None
 
     results = []
     base_path = r"SYSTEM\CurrentControlSet\Control\Video"
@@ -173,23 +181,24 @@ def _find_nvidia_video_keys():
                                 sub = winreg.EnumKey(gk, j)
                             except OSError:
                                 break
-                            if sub == "0000":
-                                sub_path = f"{guid_path}\\0000"
-                                try:
-                                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub_path) as sk:
-                                        try:
-                                            desc, _ = winreg.QueryValueEx(sk, "DriverDesc")
-                                        except FileNotFoundError:
-                                            desc = ""
-                                        if "nvidia" in desc.lower():
-                                            # Verify it has color-related values
-                                            try:
-                                                winreg.QueryValueEx(sk, "Brightness")
-                                                results.append((guid_path, sub_path))
-                                            except FileNotFoundError:
-                                                pass
-                                except OSError:
-                                    pass
+                            sub_path = f"{guid_path}\\{sub}"
+                            try:
+                                with winreg.OpenKey(
+                                    winreg.HKEY_LOCAL_MACHINE, sub_path
+                                ) as sk:
+                                    desc = _val(sk, "DriverDesc")
+                                    if desc and "nvidia" in desc.lower():
+                                        b = _val(sk, "Brightness")
+                                        c = _val(sk, "Contrast")
+                                        v = _val(sk, "DigitalVibrance")
+                                        if (
+                                            b is not None
+                                            and c is not None
+                                            and v is not None
+                                        ):
+                                            results.append((guid_path, sub_path))
+                            except OSError:
+                                pass
                             j += 1
                 except OSError:
                     pass
@@ -223,6 +232,73 @@ def _set_gamma_ramp(gamma_val):
         ctypes.windll.gdi32.DeleteDC(hdc)
 
 
+def _nvapi_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Fallback: apply color settings via NVAPI (nvapi64.dll) ctypes."""
+    try:
+        nvapi = ctypes.WinDLL("nvapi64.dll")
+    except OSError:
+        return False
+
+    NvAPI_Initialize = nvapi[1]  # ordinal 1
+    NvAPI_Initialize.restype = ctypes.c_int32
+    NvAPI_EnumDisplayHandles = nvapi[4]  # ordinal 4
+    NvAPI_EnumDisplayHandles.restype = ctypes.c_int32
+    NvAPI_Disp_ColorControl = nvapi[55]  # ordinal 55
+    NvAPI_Disp_ColorControl.restype = ctypes.c_int32
+
+    if NvAPI_Initialize() != 0:
+        return False
+
+    class NV_DISPLAY_COLOR_CONTROL_PARAMS(ctypes.Structure):
+        _fields_ = [
+            ("version", ctypes.c_uint32),
+            ("cmd", ctypes.c_uint32),
+            ("channel", ctypes.c_uint32),
+            ("colorSetting", ctypes.c_uint32),
+            ("value", ctypes.c_float),
+            ("reserved", ctypes.c_uint32 * 31),
+        ]
+
+    # Build the version manually: (0..31) << 16 | sizeof(struct)
+    ctrl_size = ctypes.sizeof(NV_DISPLAY_COLOR_CONTROL_PARAMS)
+    version = (0x20 << 16) | ctrl_size
+
+    NvAPI_DISP_COLOR_SETTING_BRIGHTNESS = 0
+    NvAPI_DISP_COLOR_SETTING_CONTRAST = 1
+    NvAPI_DISP_COLOR_SETTING_GAMMA = 4
+    NvAPI_DISP_COLOR_SETTING_DIGITAL_VIBRANCE = 5
+    NV_DISPLAY_COLOR_CHANNEL_ALL = 0
+    NV_DISPLAY_COLOR_CMD_SET = 1
+
+    handles = (ctypes.c_uint32 * 64)()
+    count = ctypes.c_uint32(64)
+
+    ret = NvAPI_EnumDisplayHandles(
+        ctypes.byref(handles), ctypes.byref(count)
+    )
+    if ret != 0:
+        return False
+
+    settings = [
+        (NvAPI_DISP_COLOR_SETTING_BRIGHTNESS, brightness_pct),
+        (NvAPI_DISP_COLOR_SETTING_CONTRAST, contrast_pct),
+        (NvAPI_DISP_COLOR_SETTING_GAMMA, gamma_val),
+        (NvAPI_DISP_COLOR_SETTING_DIGITAL_VIBRANCE, vibrance_pct),
+    ]
+
+    for i in range(count.value):
+        h = handles[i]
+        for setting, val in settings:
+            params = NV_DISPLAY_COLOR_CONTROL_PARAMS()
+            params.version = version
+            params.cmd = NV_DISPLAY_COLOR_CMD_SET
+            params.channel = NV_DISPLAY_COLOR_CHANNEL_ALL
+            params.colorSetting = setting
+            params.value = float(val)
+            NvAPI_Disp_ColorControl(h, ctypes.byref(params))
+    return True
+
+
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
     import winreg
 
@@ -231,31 +307,45 @@ def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
 
     keys = _find_nvidia_video_keys()
-    if not keys:
-        raise RuntimeError(
-            "NVIDIA display registry key not found. "
-            "Ensure NVIDIA driver is installed and a monitor is connected."
-        )
 
-    for _, key_path in keys:
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                key_path,
-                0,
-                winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
-            ) as k:
-                for name, val in [("Brightness", b_val), ("Contrast", c_val), ("DigitalVibrance", v_val)]:
-                    try:
-                        winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
-                    except Exception:
-                        pass
-        except Exception:
-            continue
+    if keys:
+        for _, key_path in keys:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    key_path,
+                    0,
+                    winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+                ) as k:
+                    for name, val in [
+                        ("Brightness", b_val),
+                        ("Contrast", c_val),
+                        ("DigitalVibrance", v_val),
+                    ]:
+                        try:
+                            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
+                        except Exception:
+                            pass
+            except Exception:
+                continue
 
-    _set_gamma_ramp(gamma_val)
-    _broadcast_display_change()
-    time.sleep(0.5)
+        _set_gamma_ramp(gamma_val)
+        _broadcast_display_change()
+        time.sleep(0.5)
+        return
+
+    # Fallback: try NVAPI
+    if _nvapi_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+        _set_gamma_ramp(gamma_val)
+        time.sleep(0.5)
+        return
+
+    raise RuntimeError(
+        "Не найден ключ реестра NVIDIA. "
+        "Убедитесь, что драйвер NVIDIA установлен и монитор подключён. "
+        "Попробуйте открыть Панель управления NVIDIA -> "
+        "Настройка цвета рабочего стола и нажать 'Применить'."
+    )
 
 
 def reset_nvidia_settings():
