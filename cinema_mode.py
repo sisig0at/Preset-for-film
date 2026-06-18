@@ -147,7 +147,7 @@ def change_resolution(width, height):
 
 
 # ---------------------------------------------------------------------------
-# NVIDIA desktop color control via HKCU registry
+# NVIDIA desktop color control via .reg profile import
 # ---------------------------------------------------------------------------
 def _broadcast_display_change():
     ctypes.windll.user32.SendMessageTimeoutW(
@@ -155,57 +155,188 @@ def _broadcast_display_change():
     )
 
 
-def _nv_registry_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    """Write color values to HKCU so NVIDIA Control Panel sliders move."""
+def _find_target_display_keys():
+    """Return HKLM subkey paths that belong to the 'Odyssey G70B' monitor.
+    Falls back to any NVIDIA display key if the target monitor is not found."""
     import winreg
+
+    results = []
+    i = 0
+    while True:
+        try:
+            adapter = win32api.EnumDisplayDevices(None, i, 0)
+        except Exception:
+            break
+        if not adapter.DeviceName:
+            break
+        j = 0
+        while True:
+            try:
+                monitor = win32api.EnumDisplayDevices(adapter.DeviceName, j, 0)
+            except Exception:
+                break
+            if not monitor.DeviceString:
+                break
+            name = monitor.DeviceString.lower()
+            if "odyssey" in name or "g70" in name:
+                raw = adapter.DeviceKey
+                pfx = "\\Registry\\Machine\\"
+                if raw.startswith(pfx):
+                    raw = raw[len(pfx):]
+                raw = raw.rstrip("\\")
+                if raw:
+                    results.append(raw)
+                break
+            j += 1
+        i += 1
+
+    if results:
+        return results
+
+    return _find_any_nvidia_hklm_keys()
+
+
+def _find_any_nvidia_hklm_keys():
+    """Fallback: scan all GUID subkeys for any NVIDIA display adapter."""
+    import winreg
+
+    def _val(key, name):
+        try:
+            v, _ = winreg.QueryValueEx(key, name)
+            return v
+        except FileNotFoundError:
+            return None
+
+    results = []
+    base = r"SYSTEM\CurrentControlSet\Control\Video"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+            g = 0
+            while True:
+                try:
+                    guid = winreg.EnumKey(root, g)
+                except OSError:
+                    break
+                gp = f"{base}\\{guid}"
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, gp) as gk:
+                        s = 0
+                        while True:
+                            try:
+                                sub = winreg.EnumKey(gk, s)
+                            except OSError:
+                                break
+                            sp = f"{gp}\\{sub}"
+                            try:
+                                with winreg.OpenKey(
+                                    winreg.HKEY_LOCAL_MACHINE, sp
+                                ) as sk:
+                                    d = _val(sk, "DriverDesc")
+                                    if d and "nvidia" in d.lower():
+                                        b = _val(sk, "Brightness")
+                                        c = _val(sk, "Contrast")
+                                        v = _val(sk, "DigitalVibrance")
+                                        if (
+                                            b is not None
+                                            and c is not None
+                                            and v is not None
+                                        ):
+                                            results.append(sp)
+                            except OSError:
+                                pass
+                            s += 1
+                except OSError:
+                    pass
+                g += 1
+    except OSError:
+        pass
+    return results
+
+
+def _apply_color_profiles(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Build a .reg file in memory, import it via reg.exe, then broadcast."""
+    import winreg
+    import tempfile
 
     b_val = int(max(0, min(100, brightness_pct)) * 2.55)
     c_val = int(max(0, min(100, contrast_pct)) * 2.55)
     v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
     g_val = max(0, min(255, int(gamma_val * 128)))
 
-    base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
+    lines = ["Windows Registry Editor Version 5.00", ""]
+
+    # HKLM driver-level paths
+    for key_path in _find_target_display_keys():
+        full_path = f"HKEY_LOCAL_MACHINE\\{key_path}"
+        lines.append(f"[{full_path}]")
+        lines.append(f'"Brightness"=dword:{b_val:08x}')
+        lines.append(f'"Contrast"=dword:{c_val:08x}')
+        lines.append(f'"DigitalVibrance"=dword:{v_val:08x}')
+        lines.append("")
+
+    # HKCU NVIDIA Control Panel slider paths
     try:
+        base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as root:
-            i = 0
+            h = 0
             while True:
                 try:
-                    sub = winreg.EnumKey(root, i)
+                    sub = winreg.EnumKey(root, h)
                 except OSError:
                     break
                 sub_path = f"{base}\\{sub}"
                 try:
                     with winreg.OpenKey(
                         winreg.HKEY_CURRENT_USER, sub_path, 0,
-                        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+                        winreg.KEY_QUERY_VALUE,
                     ) as k:
                         try:
                             winreg.QueryValueEx(k, "Brightness")
                         except FileNotFoundError:
-                            i += 1
+                            h += 1
                             continue
-                        pairs = [
-                            ("Brightness", b_val),
-                            ("Contrast", c_val),
-                            ("Gamma", g_val),
-                            ("DigitalVibrance", v_val),
-                        ]
-                        for name, val in pairs:
-                            try:
-                                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
-                            except Exception:
-                                pass
+                    full = f"HKEY_CURRENT_USER\\{sub_path}"
+                    lines.append(f"[{full}]")
+                    lines.append(f'"Brightness"=dword:{b_val:08x}')
+                    lines.append(f'"Contrast"=dword:{c_val:08x}')
+                    lines.append(f'"Gamma"=dword:{g_val:08x}')
+                    lines.append(f'"DigitalVibrance"=dword:{v_val:08x}')
+                    lines.append("")
                 except OSError:
                     pass
-                i += 1
+                h += 1
     except OSError:
         pass
+
+    if len(lines) < 3:
+        return
+
+    reg_content = "\r\n".join(lines)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".reg", delete=False, encoding="utf-16le"
+    ) as f:
+        f.write(reg_content)
+        tmp_path = f.name
+
+    try:
+        subprocess.run(
+            ["reg", "import", tmp_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
     _broadcast_display_change()
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    _nv_registry_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
+    _apply_color_profiles(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     time.sleep(0.5)
 
 
