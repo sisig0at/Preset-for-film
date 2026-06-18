@@ -215,32 +215,51 @@ def _broadcast_display_change():
     )
 
 
-def _set_display_color(brightness_pct, contrast_pct, gamma_val):
-    """Apply brightness, contrast, and gamma via native WinAPI gamma ramp.
-    Works on any GPU and driver without NVIDIA-specific APIs."""
-    brightness_pct = max(0, min(100, brightness_pct))
-    contrast_pct = max(0, min(100, contrast_pct))
-    gamma_val = max(0.1, min(3.0, gamma_val))
+def _apply_nvidia_hkcu(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Write color settings to HKCU so NVIDIA Control Panel sliders move."""
+    import winreg
 
-    b_off = (brightness_pct - 50) / 50.0
-    c_mult = contrast_pct / 50.0
+    b_val = int(max(0, min(100, brightness_pct)) * 2.55)
+    c_val = int(max(0, min(100, contrast_pct)) * 2.55)
+    v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
+    g_val = max(0, min(255, int(gamma_val * 128)))
 
-    ramp = (ctypes.c_uint16 * 256)()
-    for i in range(256):
-        v = (i / 255.0 - 0.5) * c_mult + 0.5 + b_off * 0.5
-        v = max(0.0, min(1.0, v))
-        v = pow(v, 1.0 / gamma_val)
-        ramp[i] = max(0, min(65535, int(round(v * 65535.0))))
-
-    total = (ctypes.c_uint16 * (256 * 3))()
-    for ch in range(3):
-        for j in range(256):
-            total[ch * 256 + j] = ramp[j]
-
-    hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)
-    if hdc:
-        ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, total)
-        ctypes.windll.gdi32.DeleteDC(hdc)
+    base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as root:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                sub_path = f"{base}\\{sub}"
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_CURRENT_USER, sub_path, 0,
+                        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+                    ) as k:
+                        try:
+                            winreg.QueryValueEx(k, "Brightness")
+                        except FileNotFoundError:
+                            i += 1
+                            continue
+                        pairs = [
+                            ("Brightness", b_val),
+                            ("Contrast", c_val),
+                            ("Gamma", g_val),
+                            ("DigitalVibrance", v_val),
+                        ]
+                        for name, val in pairs:
+                            try:
+                                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
+                            except Exception:
+                                pass
+                except OSError:
+                    pass
+                i += 1
+    except OSError:
+        pass
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
@@ -250,10 +269,10 @@ def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     c_val = int(max(0, min(100, contrast_pct)) * 2.55)
     v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
 
-    # Base visual adjustment via stable WinAPI gamma ramp (brightness + contrast + gamma)
-    _set_display_color(brightness_pct, contrast_pct, gamma_val)
+    # Write to HKCU so NVIDIA Control Panel sliders reflect the change
+    _apply_nvidia_hkcu(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
 
-    # NVIDIA registry writes – best-effort (Brightness / Contrast / DigitalVibrance)
+    # Write to HKLM driver-level registry as well
     keys = _find_nvidia_video_keys()
     if keys:
         for _, key_path in keys:
@@ -272,11 +291,11 @@ def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
                     try:
                         winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, v_val)
                     except Exception as exc:
-                        print(f"[WARN] DigitalVibrance write failed: {exc}")
+                        print(f"[WARN] DigitalVibrance HKLM write failed: {exc}")
             except Exception:
                 continue
-        _broadcast_display_change()
 
+    _broadcast_display_change()
     time.sleep(0.5)
 
 
@@ -707,10 +726,10 @@ class CinemaModeApp:
         kill_app("TorrServer.exe")
         time.sleep(0.5)
 
+        # HDR must be turned off FIRST, before any color or resolution changes
         self._set_status("Отключение HDR...")
-        time.sleep(1.5)
         toggle_hdr(enable=False)
-        time.sleep(1.5)
+        time.sleep(2.0)
 
         b = self._get_slider_val("brightness")
         c = self._get_slider_val("contrast")
