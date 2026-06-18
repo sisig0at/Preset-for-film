@@ -26,7 +26,6 @@ _DEPENDENCIES = [
     ("customtkinter", "customtkinter"),
     ("pyautogui", "pyautogui"),
     ("win32api", "pywin32"),
-    ("pvc", "pvc"),
 ]
 
 for _mod_name, _pip_name in _DEPENDENCIES:
