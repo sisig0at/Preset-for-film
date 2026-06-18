@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
 Cinema Mode Switcher for Windows 11 + Samsung Odyssey G70B + NVIDIA GPU.
-Supports 2K/4K resolution switching, NVIDIA color control via direct registry
-access (no external tools), WinAPI-based HDR status detection and toggle
-(Win+Alt+B), and app lifecycle (Lampa + TorrServer).
-
-100% self-contained -- no ColorControl.exe or .NET dependencies.
+Hybrid CLI approach: ColorControl.exe for NVIDIA color, PowerShell CIM for
+HDR detection, Win+Alt+B for HDR toggle. .NET 8 Desktop Runtime is
+bootstrapped automatically if missing.
 """
 
 import importlib
@@ -16,12 +14,65 @@ import json
 import time
 import threading
 import ctypes
-from ctypes import wintypes
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Self-installation block -- runs before any third-party import
-# ---------------------------------------------------------------------------
+# ===================================================================
+# SELF-INSTALLATION BLOCK
+# ===================================================================
+
+def _ensure_dotnet_runtime():
+    """Auto-install .NET 8 Desktop Runtime if missing (used by ColorControl.exe)."""
+    try:
+        r = subprocess.run(
+            ["dotnet", "--list-runtimes"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if "Microsoft.WindowsDesktop.App" in r.stdout and " 8." in r.stdout:
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        r = subprocess.run(
+            ["where", "dotnet"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            d = subprocess.run(
+                ["dotnet", "--list-runtimes"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if "Microsoft.WindowsDesktop.App" in d.stdout and " 8." in d.stdout:
+                return True
+    except Exception:
+        pass
+
+    print("Bootstrapping .NET 8 Desktop Runtime (silent install)...")
+    try:
+        subprocess.run(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                "iex ((New-Object System.Net.WebClient).DownloadString('https://dot.net')); dotnet-install.ps1 -Runtime windowsdesktop -Version 8.0",
+            ],
+            timeout=300,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        dotnet_dir = os.path.join(os.environ.get("USERPROFILE", ""), ".dotnet")
+        if os.path.isdir(dotnet_dir) and dotnet_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = dotnet_dir + os.pathsep + os.environ.get("PATH", "")
+        print(".NET 8 bootstrap complete.")
+        return True
+    except Exception as e:
+        print(f"Warning: .NET install skipped ({e})")
+        return False
+
+
+_ensure_dotnet_runtime()
+
+# Python package dependencies
 _DEPENDENCIES = [
     ("customtkinter", "customtkinter"),
     ("pyautogui", "pyautogui"),
@@ -41,118 +92,28 @@ for _mod_name, _pip_name in _DEPENDENCIES:
         importlib.invalidate_caches()
 
 # ---------------------------------------------------------------------------
-# Third-party imports (guaranteed available)
-# ---------------------------------------------------------------------------
 import customtkinter as ctk
 import win32api
 import win32con
 import win32gui
-import win32print
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# ===================================================================
+# CONSTANTS
+# ===================================================================
+
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 APP_NAME = "Cinema Mode Switcher"
-
+COLORCTRL_EXE = Path(__file__).resolve().parent / "ColorControl.exe"
 RES_4K = (3840, 2160)
 RES_2K = (2560, 1440)
 
-# ---------------------------------------------------------------------------
-# Win32 / ctypes helpers
-# ---------------------------------------------------------------------------
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-HWND_BROADCAST = 0xFFFF
-WM_SETTINGCHANGE = 0x001A
-SMTO_ABORTIFHUNG = 0x0002
+# ===================================================================
+# DEVMODE — resolution switching
+# ===================================================================
 
-# ---- DISPLAYCONFIG structures for HDR detection (Win10 2004+) ----
-QDC_ONLY_ACTIVE_PATHS = 2
-DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO = 7
-
-
-class LUID(ctypes.Structure):
-    _fields_ = [
-        ("LowPart", wintypes.DWORD),
-        ("HighPart", wintypes.LONG),
-    ]
-
-
-class DISPLAYCONFIG_RATIONAL(ctypes.Structure):
-    _fields_ = [
-        ("Numerator", wintypes.DWORD),
-        ("Denominator", wintypes.DWORD),
-    ]
-
-
-class DISPLAYCONFIG_PATH_SOURCE_INFO(ctypes.Structure):
-    _fields_ = [
-        ("adapterId", LUID),
-        ("id", wintypes.DWORD),
-        ("modeInfoIdx", wintypes.DWORD),
-        ("cloneGroupId", wintypes.DWORD),
-        ("sourceDeviceInfo", wintypes.DWORD),
-    ]
-
-
-class DISPLAYCONFIG_PATH_TARGET_INFO(ctypes.Structure):
-    _fields_ = [
-        ("adapterId", LUID),
-        ("id", wintypes.DWORD),
-        ("modeInfoIdx", wintypes.DWORD),
-        ("outputTechnology", wintypes.DWORD),
-        ("rotation", wintypes.DWORD),
-        ("scaling", wintypes.DWORD),
-        ("refreshRate", DISPLAYCONFIG_RATIONAL),
-        ("scanLineOrdering", wintypes.DWORD),
-        ("targetAvailable", wintypes.BOOL),
-        ("statusFlags", wintypes.DWORD),
-    ]
-
-
-class DISPLAYCONFIG_PATH_INFO(ctypes.Structure):
-    _fields_ = [
-        ("sourceInfo", DISPLAYCONFIG_PATH_SOURCE_INFO),
-        ("targetInfo", DISPLAYCONFIG_PATH_TARGET_INFO),
-        ("flags", wintypes.DWORD),
-    ]
-
-
-class DISPLAYCONFIG_DEVICE_INFO_HEADER(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("size", wintypes.DWORD),
-        ("adapterId", LUID),
-        ("id", wintypes.DWORD),
-    ]
-
-
-class DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO(ctypes.Structure):
-    _fields_ = [
-        ("header", DISPLAYCONFIG_DEVICE_INFO_HEADER),
-        ("value", wintypes.DWORD),
-        ("colorEncoding", wintypes.DWORD),
-        ("bitsPerChannel", wintypes.DWORD),
-    ]
-
-
-# Validate struct sizes at import time (matches MSVC x64/x86 layout)
-_STRUCT_SIZES = {
-    DISPLAYCONFIG_PATH_SOURCE_INFO: 24,
-    DISPLAYCONFIG_PATH_TARGET_INFO: 48,
-    DISPLAYCONFIG_PATH_INFO: 76,
-    DISPLAYCONFIG_DEVICE_INFO_HEADER: 20,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO: 32,
-}
-for _struct_cls, _expected in _STRUCT_SIZES.items():
-    actual = ctypes.sizeof(_struct_cls)
-    if actual != _expected:
-        print(f"Warning: {_struct_cls.__name__} size {actual} != expected {_expected}")
-
-
-# ---- DEVMODE structure for resolution switching ----
 class DEVMODEW(ctypes.Structure):
     _fields_ = [
         ("dmDeviceName", ctypes.c_wchar * 32),
@@ -192,10 +153,6 @@ class DEVMODEW(ctypes.Structure):
     ]
 
 
-# ===================================================================
-# RESOLUTION SWITCHING
-# ===================================================================
-
 def _build_devmode(width, height, freq):
     dm = DEVMODEW()
     dm.dmSize = ctypes.sizeof(DEVMODEW)
@@ -232,185 +189,57 @@ def change_resolution(width, height):
 
 
 # ===================================================================
-# SMART HDR STATUS DETECTION (WinAPI + fallback)
+# NVIDIA COLOR CONTROL  (ColorControl.exe primary, registry fallback)
 # ===================================================================
 
-def _fallback_is_hdr_enabled():
-    """Fallback HDR detection via registry + PowerShell."""
-    import winreg
-
-    paths = [
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\HDR"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\HDR"),
-    ]
-    for hive, path in paths:
-        try:
-            with winreg.OpenKey(hive, path) as k:
-                val, _ = winreg.QueryValueEx(k, "AllowHDR")
-                return bool(val)
-        except (FileNotFoundError, OSError):
-            continue
-
-    try:
-        r = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "(Get-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\HDR' -Name AllowHDR -ErrorAction SilentlyContinue).AllowHDR",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip() == "1"
-    except Exception:
-        pass
-
-    return False
-
-
-def is_hdr_enabled():
-    """
-    Check the real-time HDR status of the primary display using the
-    Windows DisplayConfig API (Win10 2004+).
-
-    Uses QueryDisplayConfig to enumerate active paths, then calls
-    DisplayConfigGetDeviceInfo with DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO
-    to read the advancedColorEnabled flag for each active target.
-
-    Falls back to registry-based detection if the API is unavailable.
-    """
-    try:
-        num_paths = wintypes.UINT32(0)
-        num_modes = wintypes.UINT32(0)
-
-        result = user32.GetDisplayConfigBufferSizes(
-            QDC_ONLY_ACTIVE_PATHS,
-            ctypes.byref(num_paths),
-            ctypes.byref(num_modes),
-        )
-        if result != 0:
-            return _fallback_is_hdr_enabled()
-
-        path_array = (DISPLAYCONFIG_PATH_INFO * num_paths.value)()
-        mode_array = (ctypes.c_byte * (64 * num_modes.value))()
-
-        actual_paths = wintypes.UINT32(num_paths.value)
-        actual_modes = wintypes.UINT32(num_modes.value)
-
-        result = user32.QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            ctypes.byref(actual_paths),
-            path_array,
-            ctypes.byref(actual_modes),
-            mode_array,
-            None,
-        )
-        if result != 0:
-            return _fallback_is_hdr_enabled()
-
-        for i in range(actual_paths.value):
-            path = path_array[i]
-            ac_info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO()
-            ac_info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO
-            ac_info.header.size = ctypes.sizeof(DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO)
-            ac_info.header.adapterId = path.targetInfo.adapterId
-            ac_info.header.id = path.targetInfo.id
-
-            result = user32.DisplayConfigGetDeviceInfo(ctypes.byref(ac_info))
-            if result == 0:
-                if ac_info.value & 0x2:  # bit 1 = advancedColorEnabled
-                    return True
-
+def _colorcontrol_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Apply colour settings via ColorControl.exe CLI."""
+    if not COLORCTRL_EXE.is_file():
         return False
-    except Exception:
-        return _fallback_is_hdr_enabled()
 
+    gamma_raw = max(0, min(100, int(round(gamma_val * 50))))
+    b = max(0, min(100, int(round(brightness_pct))))
+    c = max(0, min(100, int(round(contrast_pct))))
+    v = max(0, min(100, int(round(vibrance_pct))))
 
-# ===================================================================
-# NVIDIA COLOR CONTROL -- fully autonomous (direct registry + broadcast)
-# ===================================================================
-
-def _broadcast_display_change():
-    """Notify the shell that display settings have changed."""
     try:
-        user32.SendMessageTimeoutW(
-            HWND_BROADCAST,
-            WM_SETTINGCHANGE,
-            0,
-            "Display",
-            SMTO_ABORTIFHUNG,
-            500,
-            None,
+        subprocess.run(
+            [
+                str(COLORCTRL_EXE),
+                "-vibrance", str(v),
+                "-brightness", str(b),
+                "-contrast", str(c),
+                "-gamma", str(gamma_raw),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
         )
+        return True
     except Exception:
-        pass
+        return False
 
 
-def _find_target_display_keys():
-    """
-    Locate the exact HKLM registry path(s) for the primary Samsung Odyssey G70B
-    (or any attached NVIDIA display as fallback).
-
-    Returns a list of paths relative to HKEY_LOCAL_MACHINE, e.g.:
-        SYSTEM\\CurrentControlSet\\Control\\Video\\{GUID}\\0000
-    """
-    keys = []
-
-    # Pass 1: find the primary monitor by checking StateFlags and device name
-    i = 0
-    while True:
-        try:
-            adapter = win32api.EnumDisplayDevices(None, i, 0)
-        except Exception:
-            break
-        if not adapter.DeviceName:
-            break
-
-        is_primary = bool(getattr(adapter, "StateFlags", 0) & 0x00000001)
-
-        j = 0
-        while True:
-            try:
-                monitor = win32api.EnumDisplayDevices(adapter.DeviceName, j, 0)
-            except Exception:
-                break
-            if not monitor.DeviceString:
-                break
-
-            name = monitor.DeviceString.lower()
-            is_target = ("odyssey" in name or "g70" in name)
-
-            if is_target or (is_primary and is_target):
-                raw = adapter.DeviceKey
-                pfx = "\\Registry\\Machine\\"
-                if raw.startswith(pfx):
-                    raw = raw[len(pfx):]
-                raw = raw.rstrip("\\")
-                if raw:
-                    keys.append(raw)
-                break
-            j += 1
-
-        i += 1
-
-    if keys:
-        return keys
-
-    # Pass 2: fallback -- scan all GUID subkeys for any NVIDIA display adapter
+def _registry_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Fallback: write NVIDIA colour values directly to the registry."""
     import winreg
 
-    def _val(key, name):
-        try:
-            v, _ = winreg.QueryValueEx(key, name)
-            return v
-        except FileNotFoundError:
-            return None
+    def pct_to_reg(pct):
+        return max(0, min(255, round(max(0, min(100, pct)) / 100.0 * 255)))
 
-    base = r"SYSTEM\CurrentControlSet\Control\Video"
+    def gamma_to_reg(g):
+        return max(0, min(255, round(g * 128)))
+
+    b_val = pct_to_reg(brightness_pct)
+    c_val = pct_to_reg(contrast_pct)
+    g_val = gamma_to_reg(gamma_val)
+    v_val = pct_to_reg(vibrance_pct)
+
+    keys_written = False
+
+    # HKLM driver-level
     try:
+        base = r"SYSTEM\CurrentControlSet\Control\Video"
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
             g = 0
             while True:
@@ -418,147 +247,134 @@ def _find_target_display_keys():
                     guid = winreg.EnumKey(root, g)
                 except OSError:
                     break
-                gp = f"{base}\\{guid}"
                 try:
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, gp) as gk:
-                        s = 0
-                        while True:
-                            try:
-                                sub = winreg.EnumKey(gk, s)
-                            except OSError:
-                                break
-                            sp = f"{gp}\\{sub}"
-                            try:
-                                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sp) as sk:
-                                    d = _val(sk, "DriverDesc")
-                                    if d and "nvidia" in d.lower():
-                                        b = _val(sk, "Brightness")
-                                        c = _val(sk, "Contrast")
-                                        v = _val(sk, "DigitalVibrance")
-                                        if b is not None and c is not None and v is not None:
-                                            keys.append(sp)
-                            except OSError:
-                                pass
-                            s += 1
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{base}\\{guid}\\0000") as sk:
+                        try:
+                            desc, _ = winreg.QueryValueEx(sk, "DriverDesc")
+                        except FileNotFoundError:
+                            g += 1
+                            continue
+                        if "nvidia" not in desc.lower():
+                            g += 1
+                            continue
+                    with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE, f"{base}\\{guid}\\0000",
+                        0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+                    ) as k:
+                        winreg.SetValueEx(k, "Brightness", 0, winreg.REG_DWORD, b_val)
+                        winreg.SetValueEx(k, "Contrast", 0, winreg.REG_DWORD, c_val)
+                        winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, v_val)
+                        keys_written = True
                 except OSError:
                     pass
                 g += 1
     except OSError:
         pass
 
-    return keys
-
-
-def _write_nvidia_registry(brightness_val, contrast_val, gamma_val, vibrance_val):
-    """
-    Write color values directly to the NVIDIA driver registry keys and the
-    NVIDIA Control Panel per-display subkeys.
-
-    Parameters are the raw DWORD values (0-255):
-        128 = neutral 50% for Brightness/Contrast/Vibrance
-        128 = gamma 1.0
-    """
-    import winreg
-
-    if brightness_val is None:
-        brightness_val = 128
-    if contrast_val is None:
-        contrast_val = 128
-    if gamma_val is None:
-        gamma_val = 128
-    if vibrance_val is None:
-        vibrance_val = 128
-
-    keys_written = False
-
-    # --- HKLM driver-level paths ---
-    for key_path in _find_target_display_keys():
-        try:
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                key_path,
-                0,
-                winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
-            ) as k:
-                winreg.SetValueEx(k, "Brightness", 0, winreg.REG_DWORD, brightness_val)
-                winreg.SetValueEx(k, "Contrast", 0, winreg.REG_DWORD, contrast_val)
-                winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, vibrance_val)
-            keys_written = True
-        except (FileNotFoundError, OSError):
-            continue
-
-    # --- HKCU NVIDIA Control Panel slider paths ---
+    # HKCU control panel
     try:
-        base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as root:
+        cp_base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cp_base) as root:
             h = 0
             while True:
                 try:
                     sub = winreg.EnumKey(root, h)
                 except OSError:
                     break
-                sub_path = f"{base}\\{sub}"
                 try:
                     with winreg.OpenKey(
-                        winreg.HKEY_CURRENT_USER,
-                        sub_path,
-                        0,
-                        winreg.KEY_SET_VALUE,
+                        winreg.HKEY_CURRENT_USER, f"{cp_base}\\{sub}",
+                        0, winreg.KEY_SET_VALUE,
                     ) as k:
-                        winreg.SetValueEx(k, "Brightness", 0, winreg.REG_DWORD, brightness_val)
-                        winreg.SetValueEx(k, "Contrast", 0, winreg.REG_DWORD, contrast_val)
-                        winreg.SetValueEx(k, "Gamma", 0, winreg.REG_DWORD, gamma_val)
-                        winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, vibrance_val)
+                        winreg.SetValueEx(k, "Brightness", 0, winreg.REG_DWORD, b_val)
+                        winreg.SetValueEx(k, "Contrast", 0, winreg.REG_DWORD, c_val)
+                        winreg.SetValueEx(k, "Gamma", 0, winreg.REG_DWORD, g_val)
+                        winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, v_val)
                         keys_written = True
-                except (FileNotFoundError, OSError):
+                except OSError:
                     pass
                 h += 1
     except OSError:
         pass
 
-    if not keys_written:
-        raise RuntimeError("No NVIDIA display registry keys found; cannot apply color settings.")
+    if keys_written:
+        try:
+            user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Display", 0x0002, 500, None)
+        except Exception:
+            pass
 
-    _broadcast_display_change()
-
-
-def _pct_to_reg(pct):
-    """Convert percentage (0-100) to registry DWORD (0-255)."""
-    return max(0, min(255, round(max(0, min(100, pct)) / 100.0 * 255)))
-
-
-def _gamma_to_reg(gamma):
-    """Convert gamma float (e.g. 1.0) to registry DWORD (0-255, 128 = 1.0)."""
-    return max(0, min(255, round(gamma * 128)))
+    return keys_written
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    """
-    Apply NVIDIA color settings by writing directly to the registry
-    and broadcasting the change. No external tools required.
-    """
-    b_val = _pct_to_reg(brightness_pct)
-    c_val = _pct_to_reg(contrast_pct)
-    g_val = _gamma_to_reg(gamma_val)
-    v_val = _pct_to_reg(vibrance_pct)
-    _write_nvidia_registry(b_val, c_val, g_val, v_val)
-    time.sleep(0.5)
+    """Apply NVIDIA color settings (ColorControl.exe → registry fallback)."""
+    if _colorcontrol_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+        time.sleep(0.3)
+        return
+    _registry_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
+    time.sleep(0.3)
 
 
 def reset_nvidia_settings():
-    """Reset to neutral defaults (50%, 50%, 1.0, 50%)."""
+    """Reset to neutral defaults (50%, 50%, 1.0, 50%) for cinema mode."""
     apply_nvidia_settings(50, 50, 1.0, 50)
 
 
 # ===================================================================
-# HDR TOGGLE (smart state-checking before hotkey)
+# HDR DETECTION  (PowerShell CIM + registry)
+# ===================================================================
+
+def _powershell_hdr_status():
+    """
+    Query real HDR state via PowerShell.
+    Returns True/False, or None if undetermined.
+    """
+    script = (
+        "$hdr=$false; "
+        "try{$v=(Get-ItemProperty -Path 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\HDR' "
+        "-Name AllowHDR -ErrorAction Stop).AllowHDR; $hdr=($v -eq 1)}catch{}; "
+        "try{$m=Get-CimInstance -Namespace 'root/wmi' -ClassName "
+        "'WmiMonitorBasicDisplayParams' -ErrorAction Stop; "
+        "if($null -eq $m -or $m.Count -eq 0){'N/A';exit}}catch{}; "
+        "if($hdr){'ON'}else{'OFF'}"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        out = r.stdout.strip()
+        if out == "ON":
+            return True
+        if out == "OFF":
+            return False
+    except Exception:
+        pass
+    return None
+
+
+def is_hdr_enabled():
+    """Return True if HDR is active on the primary display."""
+    result = _powershell_hdr_status()
+    if result is not None:
+        return result
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\HDR") as k:
+            return bool(winreg.QueryValueEx(k, "AllowHDR")[0])
+    except Exception:
+        return False
+
+
+# ===================================================================
+# HDR TOGGLE
 # ===================================================================
 
 def _send_win_alt_b():
-    """Emulate Win+Alt+B keyboard shortcut to toggle HDR."""
-    VK_LWIN = 0x5B
-    VK_LMENU = 0xA4
-    VK_B = 0x42
+    """Emulate Win+Alt+B to toggle HDR."""
+    VK_LWIN, VK_LMENU, VK_B = 0x5B, 0xA4, 0x42
 
     def press(vk):
         user32.keybd_event(vk, 0, 0, 0)
@@ -571,7 +387,7 @@ def _send_win_alt_b():
     press(VK_LMENU)
     time.sleep(0.15)
     press(VK_B)
-    time.sleep(0.20)
+    time.sleep(0.25)
     release(VK_B)
     time.sleep(0.15)
     release(VK_LMENU)
@@ -581,19 +397,11 @@ def _send_win_alt_b():
 
 
 def toggle_hdr(enable=True):
-    """
-    Toggle HDR on/off with smart state-checking.
-
-    Before sending Win+Alt+B, checks the current HDR state via the WinAPI
-    DisplayConfig path. Skips the hotkey if HDR is already in the desired
-    state, preventing accidental toggles.
-    """
+    """Smart HDR toggle — checks current state before sending Win+Alt+B."""
     hdr_on = is_hdr_enabled()
-    need_toggle = (enable and not hdr_on) or (not enable and hdr_on)
-
-    if not need_toggle:
+    need = (enable and not hdr_on) or (not enable and hdr_on)
+    if not need:
         return
-
     _send_win_alt_b()
 
 
@@ -903,7 +711,6 @@ class CinemaModeApp:
         """Cinema Mode ON: neutral colors, HDR on, 4K, launch apps."""
         self._set_status("Активация кинорежима...")
 
-        # Smart HDR: only toggle if currently OFF
         self._set_status("Проверка и включение HDR...")
         toggle_hdr(enable=True)
         time.sleep(1.5)
@@ -923,7 +730,6 @@ class CinemaModeApp:
             self._set_status("Запуск TorrServer...")
             launch_app(torr)
 
-        # Neutral defaults for cinema mode
         self._set_status("Сброс цветов NVIDIA (50% / 1.0 gamma)...")
         try:
             reset_nvidia_settings()
@@ -944,7 +750,7 @@ class CinemaModeApp:
         self._set_status("\u2705 Кинорежим активирован!")
 
     def _deactivate_cinema_mode(self):
-        """Normal Mode: kill apps, smart HDR off, 2K, user color profile."""
+        """Normal Mode: kill apps, smart HDR off, 2K, user colour profile."""
         self._set_status("Деактивация кинорежима...")
 
         self._set_status("Остановка приложений...")
@@ -952,7 +758,6 @@ class CinemaModeApp:
         kill_app("TorrServer.exe")
         time.sleep(0.5)
 
-        # Smart HDR: only toggle if currently ON
         self._set_status("Проверка и отключение HDR...")
         toggle_hdr(enable=False)
         time.sleep(2.0)
@@ -963,7 +768,6 @@ class CinemaModeApp:
             return
         time.sleep(1.5)
 
-        # Apply user's custom color profile (45%, 70%, 0.95, 66% from config)
         b = self._get_slider_val("brightness")
         c = self._get_slider_val("contrast")
         g = self._get_slider_val("gamma")
