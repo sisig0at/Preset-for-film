@@ -341,17 +341,17 @@ def toggle_hdr(enable=True):
         ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
 
     press(VK_LWIN)
-    time.sleep(0.05)
+    time.sleep(0.15)
     press(VK_LMENU)
-    time.sleep(0.05)
+    time.sleep(0.15)
     press(VK_B)
-    time.sleep(0.08)
+    time.sleep(0.20)
     release(VK_B)
-    time.sleep(0.05)
+    time.sleep(0.15)
     release(VK_LMENU)
-    time.sleep(0.05)
+    time.sleep(0.15)
     release(VK_LWIN)
-    time.sleep(1.5)
+    time.sleep(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +361,10 @@ def launch_app(path):
     if not path or not os.path.isfile(path):
         return False
     try:
+        exe_path = Path(path)
         subprocess.Popen(
-            [path],
+            [str(exe_path)],
+            cwd=str(exe_path.parent),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=subprocess.DETACHED_PROCESS,
@@ -586,6 +588,8 @@ class CinemaModeApp:
         if path:
             entry.delete(0, "end")
             entry.insert(0, path)
+            self.config.update(self._gather_ui_values())
+            save_config(self.config)
 
     def _set_status(self, msg, is_error=False):
         color = "#EF4444" if is_error else "#A3E635"
@@ -704,8 +708,9 @@ class CinemaModeApp:
         time.sleep(0.5)
 
         self._set_status("Отключение HDR...")
+        time.sleep(1.5)
         toggle_hdr(enable=False)
-        time.sleep(1.0)
+        time.sleep(1.5)
 
         b = self._get_slider_val("brightness")
         c = self._get_slider_val("contrast")
