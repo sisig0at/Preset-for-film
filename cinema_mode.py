@@ -629,7 +629,8 @@ class CinemaModeApp:
                 else:
                     self._deactivate_cinema_mode()
             except Exception as e:
-                self.root.after(0, lambda: self._set_status(f"Ошибка: {e}", True))
+                err_msg = f"Ошибка: {e}"
+                self.root.after(0, lambda: self._set_status(err_msg, True))
             finally:
                 self.root.after(0, lambda: self.toggle_btn.configure(state="normal"))
 
