@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cinema Mode Switcher for Windows 11 + Samsung Odyssey G70B + NVIDIA GPU.
-Supports 2K/4K resolution switching, NVIDIA color control via registry + gamma ramp,
+Supports 2K/4K resolution switching, NVIDIA color control via registry,
 HDR toggle (Win+Alt+B), and app lifecycle (Lampa + TorrServer).
 
 All-in-one self-contained script with automatic dependency resolution.
@@ -147,92 +147,65 @@ def change_resolution(width, height):
 
 
 # ---------------------------------------------------------------------------
-# NVIDIA desktop color control via NVAPI
+# NVIDIA desktop color control via HKCU registry
 # ---------------------------------------------------------------------------
-class _NV_COLOR_DATA(ctypes.Structure):
-    _fields_ = [
-        ("version", ctypes.c_uint32),
-        ("cmd", ctypes.c_uint32),
-        ("channel", ctypes.c_uint32),
-        ("colorSetting", ctypes.c_uint32),
-        ("value", ctypes.c_float),
-        ("reserved", ctypes.c_uint32 * 31),
-    ]
+def _broadcast_display_change():
+    ctypes.windll.user32.SendMessageTimeoutW(
+        HWND_BROADCAST, WM_SETTINGCHANGE, 0, 0, 0, 5000, None
+    )
 
 
-def _nvapi_set_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    """Apply NVIDIA color settings via NVAPI (primary method)."""
+def _nv_registry_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Write color values to HKCU so NVIDIA Control Panel sliders move."""
+    import winreg
+
+    b_val = int(max(0, min(100, brightness_pct)) * 2.55)
+    c_val = int(max(0, min(100, contrast_pct)) * 2.55)
+    v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
+    g_val = max(0, min(255, int(gamma_val * 128)))
+
+    base = r"Software\NVIDIA Corporation\Global\NVControlPanel\DesktopColorSettings"
     try:
-        nvapi = ctypes.WinDLL("nvapi64.dll")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base) as root:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                sub_path = f"{base}\\{sub}"
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_CURRENT_USER, sub_path, 0,
+                        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+                    ) as k:
+                        try:
+                            winreg.QueryValueEx(k, "Brightness")
+                        except FileNotFoundError:
+                            i += 1
+                            continue
+                        pairs = [
+                            ("Brightness", b_val),
+                            ("Contrast", c_val),
+                            ("Gamma", g_val),
+                            ("DigitalVibrance", v_val),
+                        ]
+                        for name, val in pairs:
+                            try:
+                                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
+                            except Exception:
+                                pass
+                except OSError:
+                    pass
+                i += 1
     except OSError:
-        raise RuntimeError("nvapi64.dll not found")
+        pass
 
-    NvAPI_Initialize = nvapi[1]
-    NvAPI_Initialize.restype = ctypes.c_int32
-    if NvAPI_Initialize() != 0:
-        raise RuntimeError("NvAPI_Initialize failed")
-
-    NvAPI_GetHandle = nvapi[14]
-    NvAPI_GetHandle.restype = ctypes.c_int32
-    NvAPI_GetHandle.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-
-    handle = ctypes.c_void_p()
-    found = False
-    i = 0
-    while True:
-        try:
-            dev = win32api.EnumDisplayDevices(None, i, 0)
-        except Exception:
-            break
-        if not dev.DeviceName:
-            break
-        ret = NvAPI_GetHandle(dev.DeviceName, ctypes.byref(handle))
-        if ret == 0:
-            found = True
-            break
-        i += 1
-
-    if not found:
-        raise RuntimeError("No NVIDIA display handle found via NVAPI")
-
-    ctrl_size = ctypes.sizeof(_NV_COLOR_DATA)
-    version = (2 << 16) | ctrl_size
-
-    settings = [
-        (0, float(brightness_pct)),
-        (1, float(contrast_pct)),
-        (4, float(gamma_val)),
-        (5, float(vibrance_pct)),
-    ]
-
-    for ordinal in (80, 55, 60):
-        try:
-            NvAPI_SetColorData = nvapi[ordinal]
-            break
-        except AttributeError:
-            continue
-    else:
-        raise RuntimeError("NvAPI_SetColorData ordinal not found")
-
-    NvAPI_SetColorData.restype = ctypes.c_int32
-
-    for setting, val in settings:
-        data = _NV_COLOR_DATA()
-        data.version = version
-        data.cmd = 1
-        data.channel = 0
-        data.colorSetting = setting
-        data.value = val
-        ret = NvAPI_SetColorData(handle, ctypes.byref(data))
-        if ret != 0:
-            print(f"[WARN] NVAPI color setting {setting} returned {ret}")
+    _broadcast_display_change()
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    _nvapi_set_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
+    _nv_registry_color(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     time.sleep(0.5)
 
 
@@ -641,7 +614,11 @@ class CinemaModeApp:
             launch_app(torr)
 
         self._set_status("Сброс цветов NVIDIA (50% / 1.0 gamma)...")
-        apply_nvidia_settings(50, 50, 1.0, 50)
+        try:
+            apply_nvidia_settings(50, 50, 1.0, 50)
+        except Exception as exc:
+            print(f"Color reset error: {exc}")
+            self._set_status(f"Предупреждение: сброс цветов не удался", True)
         time.sleep(0.5)
 
         self.active = True
@@ -679,7 +656,11 @@ class CinemaModeApp:
         g = self._get_slider_val("gamma")
         v = self._get_slider_val("vibrance")
         self._set_status("Применение пользовательских цветов NVIDIA...")
-        apply_nvidia_settings(b, c, g, v)
+        try:
+            apply_nvidia_settings(b, c, g, v)
+        except Exception as exc:
+            print(f"Color apply error: {exc}")
+            self._set_status(f"Предупреждение: настройка цветов не удалась", True)
         time.sleep(0.5)
 
         self.active = False
