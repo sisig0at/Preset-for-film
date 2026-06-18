@@ -16,6 +16,7 @@ import struct
 import time
 import threading
 import math
+import ctypes
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
