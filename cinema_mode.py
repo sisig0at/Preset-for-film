@@ -253,6 +253,30 @@ def _find_any_nvidia_hklm_keys():
     return results
 
 
+def _apply_colorcontrol(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+    """Apply color settings via ColorControl.exe (primary method)."""
+    exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ColorControl.exe")
+    if not os.path.isfile(exe):
+        return False
+
+    try:
+        subprocess.run(
+            [
+                exe,
+                "-vibrance", str(int(round(vibrance_pct))),
+                "-brightness", str(int(round(brightness_pct))),
+                "-contrast", str(int(round(contrast_pct))),
+                "-gamma", str(int(round(gamma_val * 50))),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _apply_color_profiles(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
     """Build a .reg file in memory, import it via reg.exe, then broadcast."""
     import winreg
@@ -336,7 +360,8 @@ def _apply_color_profiles(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    _apply_color_profiles(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
+    if not _apply_colorcontrol(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
+        _apply_color_profiles(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     time.sleep(0.5)
 
 
