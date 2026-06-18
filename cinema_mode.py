@@ -215,88 +215,32 @@ def _broadcast_display_change():
     )
 
 
-def _set_gamma_ramp(gamma_val):
+def _set_display_color(brightness_pct, contrast_pct, gamma_val):
+    """Apply brightness, contrast, and gamma via native WinAPI gamma ramp.
+    Works on any GPU and driver without NVIDIA-specific APIs."""
+    brightness_pct = max(0, min(100, brightness_pct))
+    contrast_pct = max(0, min(100, contrast_pct))
     gamma_val = max(0.1, min(3.0, gamma_val))
+
+    b_off = (brightness_pct - 50) / 50.0
+    c_mult = contrast_pct / 50.0
+
     ramp = (ctypes.c_uint16 * 256)()
     for i in range(256):
-        ramp[i] = max(0, min(65535, int(round(pow(i / 255.0, 1.0 / gamma_val) * 65535.0))))
+        v = (i / 255.0 - 0.5) * c_mult + 0.5 + b_off * 0.5
+        v = max(0.0, min(1.0, v))
+        v = pow(v, 1.0 / gamma_val)
+        ramp[i] = max(0, min(65535, int(round(v * 65535.0))))
 
     total = (ctypes.c_uint16 * (256 * 3))()
-    for i in range(3):
+    for ch in range(3):
         for j in range(256):
-            total[i * 256 + j] = ramp[j]
+            total[ch * 256 + j] = ramp[j]
 
     hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)
     if hdc:
         ctypes.windll.gdi32.SetDeviceGammaRamp(hdc, total)
         ctypes.windll.gdi32.DeleteDC(hdc)
-
-
-def _nvapi_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-    """Fallback: apply color settings via NVAPI (nvapi64.dll) ctypes."""
-    try:
-        nvapi = ctypes.WinDLL("nvapi64.dll")
-    except OSError:
-        return False
-
-    NvAPI_Initialize = nvapi[1]  # ordinal 1
-    NvAPI_Initialize.restype = ctypes.c_int32
-    NvAPI_EnumDisplayHandles = nvapi[4]  # ordinal 4
-    NvAPI_EnumDisplayHandles.restype = ctypes.c_int32
-    NvAPI_Disp_ColorControl = nvapi[55]  # ordinal 55
-    NvAPI_Disp_ColorControl.restype = ctypes.c_int32
-
-    if NvAPI_Initialize() != 0:
-        return False
-
-    class NV_DISPLAY_COLOR_CONTROL_PARAMS(ctypes.Structure):
-        _fields_ = [
-            ("version", ctypes.c_uint32),
-            ("cmd", ctypes.c_uint32),
-            ("channel", ctypes.c_uint32),
-            ("colorSetting", ctypes.c_uint32),
-            ("value", ctypes.c_float),
-            ("reserved", ctypes.c_uint32 * 31),
-        ]
-
-    # Build the version manually: (0..31) << 16 | sizeof(struct)
-    ctrl_size = ctypes.sizeof(NV_DISPLAY_COLOR_CONTROL_PARAMS)
-    version = (0x20 << 16) | ctrl_size
-
-    NvAPI_DISP_COLOR_SETTING_BRIGHTNESS = 0
-    NvAPI_DISP_COLOR_SETTING_CONTRAST = 1
-    NvAPI_DISP_COLOR_SETTING_GAMMA = 4
-    NvAPI_DISP_COLOR_SETTING_DIGITAL_VIBRANCE = 5
-    NV_DISPLAY_COLOR_CHANNEL_ALL = 0
-    NV_DISPLAY_COLOR_CMD_SET = 1
-
-    handles = (ctypes.c_uint32 * 64)()
-    count = ctypes.c_uint32(64)
-
-    ret = NvAPI_EnumDisplayHandles(
-        ctypes.byref(handles), ctypes.byref(count)
-    )
-    if ret != 0:
-        return False
-
-    settings = [
-        (NvAPI_DISP_COLOR_SETTING_BRIGHTNESS, brightness_pct),
-        (NvAPI_DISP_COLOR_SETTING_CONTRAST, contrast_pct),
-        (NvAPI_DISP_COLOR_SETTING_GAMMA, gamma_val),
-        (NvAPI_DISP_COLOR_SETTING_DIGITAL_VIBRANCE, vibrance_pct),
-    ]
-
-    for i in range(count.value):
-        h = handles[i]
-        for setting, val in settings:
-            params = NV_DISPLAY_COLOR_CONTROL_PARAMS()
-            params.version = version
-            params.cmd = NV_DISPLAY_COLOR_CMD_SET
-            params.channel = NV_DISPLAY_COLOR_CHANNEL_ALL
-            params.colorSetting = setting
-            params.value = float(val)
-            NvAPI_Disp_ColorControl(h, ctypes.byref(params))
-    return True
 
 
 def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
@@ -306,8 +250,11 @@ def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
     c_val = int(max(0, min(100, contrast_pct)) * 2.55)
     v_val = int(max(0, min(100, vibrance_pct)) * 2.55)
 
-    keys = _find_nvidia_video_keys()
+    # Base visual adjustment via stable WinAPI gamma ramp (brightness + contrast + gamma)
+    _set_display_color(brightness_pct, contrast_pct, gamma_val)
 
+    # NVIDIA registry writes – best-effort (Brightness / Contrast / DigitalVibrance)
+    keys = _find_nvidia_video_keys()
     if keys:
         for _, key_path in keys:
             try:
@@ -317,35 +264,20 @@ def apply_nvidia_settings(brightness_pct, contrast_pct, gamma_val, vibrance_pct)
                     0,
                     winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
                 ) as k:
-                    for name, val in [
-                        ("Brightness", b_val),
-                        ("Contrast", c_val),
-                        ("DigitalVibrance", v_val),
-                    ]:
+                    for name, val in [("Brightness", b_val), ("Contrast", c_val)]:
                         try:
                             winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
                         except Exception:
                             pass
+                    try:
+                        winreg.SetValueEx(k, "DigitalVibrance", 0, winreg.REG_DWORD, v_val)
+                    except Exception as exc:
+                        print(f"[WARN] DigitalVibrance write failed: {exc}")
             except Exception:
                 continue
-
-        _set_gamma_ramp(gamma_val)
         _broadcast_display_change()
-        time.sleep(0.5)
-        return
 
-    # Fallback: try NVAPI
-    if _nvapi_apply(brightness_pct, contrast_pct, gamma_val, vibrance_pct):
-        _set_gamma_ramp(gamma_val)
-        time.sleep(0.5)
-        return
-
-    raise RuntimeError(
-        "Не найден ключ реестра NVIDIA. "
-        "Убедитесь, что драйвер NVIDIA установлен и монитор подключён. "
-        "Попробуйте открыть Панель управления NVIDIA -> "
-        "Настройка цвета рабочего стола и нажать 'Применить'."
-    )
+    time.sleep(0.5)
 
 
 def reset_nvidia_settings():
